@@ -1,6 +1,6 @@
 import { test, expect } from 'vitest';
 
-import { getEffectiveAvoidNegativeTs, getMapStreamsArgs, getStreamIdsToCopy, isCopyingOnlyAudioStreams } from './streams';
+import { getEffectiveAvoidNegativeTs, getKeyframeCutSeekCompensation, getMapStreamsArgs, getStreamIdsToCopy, isCopyingOnlyAudioStreams, hasFileEdits, hasStreamEdits } from './streams';
 import type { FFprobeStreamDisposition } from '../../../common/ffprobe';
 import type { LiteFFprobeStream } from '../types';
 
@@ -217,4 +217,37 @@ test('isCopyingOnlyAudioStreams, false when copying video, subtitles, unknown st
   expect(isCopyingOnlyAudioStreams({ allFilesMeta, copyFileStreams: [{ path, streamIds: [1, 99] }] })).toBe(false);
   expect(isCopyingOnlyAudioStreams({ allFilesMeta, copyFileStreams: [{ path, streamIds: [] }] })).toBe(false);
   expect(isCopyingOnlyAudioStreams({ allFilesMeta, copyFileStreams: [] })).toBe(false);
+});
+
+test('getKeyframeCutSeekCompensation', () => {
+  const bFrames = [{ has_b_frames: 2 }, {}];
+  const compensation = 3 / 23 + 0.001;
+
+  expect(getKeyframeCutSeekCompensation({ formatName: 'matroska,webm', streams: bFrames, cutFrom: 6 })).toBe(compensation);
+  // no B-frames
+  expect(getKeyframeCutSeekCompensation({ formatName: 'matroska,webm', streams: [{ has_b_frames: 0 }, {}], cutFrom: 6 })).toBe(0);
+  // formats with AVFMT_SEEK_TO_PTS, or not handled
+  expect(getKeyframeCutSeekCompensation({ formatName: 'mov,mp4,m4a,3gp,3g2,mj2', streams: bFrames, cutFrom: 6 })).toBe(0);
+  expect(getKeyframeCutSeekCompensation({ formatName: undefined, streams: bFrames, cutFrom: 6 })).toBe(0);
+  // not cutting start
+  expect(getKeyframeCutSeekCompensation({ formatName: 'matroska,webm', streams: bFrames, cutFrom: 0 })).toBe(0);
+});
+
+test('hasStreamEdits', () => {
+  expect(hasStreamEdits(undefined)).toBe(false);
+  // lingering params that don't affect the export
+  expect(hasStreamEdits({ metadata: {}, bsfH264Mp4toannexb: false, crop: { left: 0, right: 0, top: 0, bottom: 0 }, aspectRatio: { num: 16, den: 0 } })).toBe(false);
+  expect(hasStreamEdits({ metadata: { language: 'eng' } })).toBe(true);
+  expect(hasStreamEdits({ metadata: { title: '' } })).toBe(true); // empty means delete
+  expect(hasStreamEdits({ metadata: {}, tag: 'hvc1' })).toBe(true);
+  expect(hasStreamEdits({ metadata: {}, disposition: 'attached_pic' })).toBe(false);
+  expect(hasStreamEdits({ metadata: {}, crop: { left: 2, right: 0, top: 0, bottom: 0 } })).toBe(true);
+});
+
+test('hasFileEdits', () => {
+  expect(hasFileEdits(undefined)).toBe(false);
+  expect(hasFileEdits({ metadata: {}, paramsByStream: new Map([[0, { metadata: { title: 'a' } }]]) })).toBe(false); // track edits don't count
+  expect(hasFileEdits({ metadata: {}, paramsByStream: new Map(), offset: 0 })).toBe(false);
+  expect(hasFileEdits({ metadata: {}, paramsByStream: new Map(), offset: 1.5 })).toBe(true);
+  expect(hasFileEdits({ metadata: { title: 'a' }, paramsByStream: new Map() })).toBe(true);
 });

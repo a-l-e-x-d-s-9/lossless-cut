@@ -16,7 +16,7 @@ import isDev from './isDev.js';
 import logger from './logger.js';
 import { parseFfmpegProgressLine } from './progress.js';
 import { formatFfmpegNumber, getFixChannelLayoutFilter, getHwaccelArgs, parseFfprobeDuration } from '../common/util.js';
-import { getFfmpegJpegQuality } from './ffmpegUtil.js';
+import { getFfmpegJpegQuality, parseBlackDetectLine, parseSilenceDetectLine } from './ffmpegUtil.js';
 import { throwIfDisabledNetworking } from './networking.js';
 
 
@@ -27,6 +27,8 @@ const runningFfmpegs = new Set<{
 }>();
 // setInterval(() => console.log(runningFfmpegs.size), 1000);
 
+// Only the bundled FFmpeg version (see script/downloadFfmpeg.ts) is supported, also when using a custom FFmpeg path.
+// Don't add code for compatibility with older versions. Older versions are not blocked, but may not work correctly.
 let customFfPath: string | undefined;
 
 // Note that this does not work on MAS because of sandbox restrictions
@@ -416,22 +418,7 @@ export async function blackDetect({ streamId, filterOptions, ...rest }: {
 }) {
   return detectIntervals({
     ...rest,
-    matchLineTokens: (line) => {
-      // eslint-disable-next-line unicorn/better-regex
-      const match = line.match(/^[blackdetect\s*@\s*0x[0-9a-f]+] black_start:([\d\\.]+) black_end:([\d\\.]+) black_duration:[\d\\.]+/);
-      if (!match) {
-        return undefined;
-      }
-      const start = parseFloat(match[1]!);
-      const end = parseFloat(match[2]!);
-      if (Number.isNaN(start) || Number.isNaN(end)) {
-        return undefined;
-      }
-      if (start < 0 || end <= 0 || start >= end) {
-        return undefined;
-      }
-      return { start, end };
-    },
+    matchLineTokens: parseBlackDetectLine,
     customArgs: [
       '-map', streamId != null ? `0:${streamId}` : 'v:0',
       '-filter:v', `blackdetect=${mapFilterOptions(filterOptions)}`,
@@ -451,23 +438,7 @@ export async function silenceDetect({ streamId, filterOptions, ...rest }: {
 }) {
   return detectIntervals({
     ...rest,
-    matchLineTokens: (line) => {
-      // eslint-disable-next-line unicorn/better-regex
-      const match = line.match(/^[silencedetect\s*@\s*0x[0-9a-f]+] silence_end: ([\d\\.]+)[|\s]+silence_duration: ([\d\\.]+)/);
-      if (!match) {
-        return undefined;
-      }
-      const end = parseFloat(match[1]!);
-      const silenceDuration = parseFloat(match[2]!);
-      if (Number.isNaN(end) || Number.isNaN(silenceDuration)) {
-        return undefined;
-      }
-      const start = end - silenceDuration;
-      if (start < 0 || end <= 0 || start >= end) {
-        return undefined;
-      }
-      return { start, end };
-    },
+    matchLineTokens: parseSilenceDetectLine,
     customArgs: [
       '-map', streamId != null ? `0:${streamId}` : 'a:0',
       '-filter:a', `silencedetect=${mapFilterOptions(filterOptions)}`,

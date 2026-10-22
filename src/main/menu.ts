@@ -227,6 +227,7 @@ export default ({ app, mainWindow, newVersion, isStoreBuild, openExternal }: {
           { type: 'separator' } as const,
           {
             label: esc(t('Exit')),
+            accelerator: 'Ctrl+Q',
             click() {
               app.quit();
             },
@@ -293,6 +294,12 @@ export default ({ app, mainWindow, newVersion, isStoreBuild, openExternal }: {
           label: esc(t('Create random segments')),
           click() {
             mainWindow.webContents.send('createRandomSegments');
+          },
+        },
+        {
+          label: esc(t('Create segments from keyframes')),
+          click() {
+            mainWindow.webContents.send('createSegmentsFromKeyframes');
           },
         },
 
@@ -432,12 +439,6 @@ export default ({ app, mainWindow, newVersion, isStoreBuild, openExternal }: {
           label: esc(t('Read all keyframes')),
           click() {
             mainWindow.webContents.send('readAllKeyframes');
-          },
-        },
-        {
-          label: esc(t('Create segments from keyframes')),
-          click() {
-            mainWindow.webContents.send('createSegmentsFromKeyframes');
           },
         },
         {

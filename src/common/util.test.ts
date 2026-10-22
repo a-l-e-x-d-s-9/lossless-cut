@@ -1,7 +1,7 @@
 // eslint-disable-next-line import/no-extraneous-dependencies
 import { describe, expect, test } from 'vitest';
 
-import { getFixChannelLayoutFilter, hasCustomChannelLayout } from './util.js';
+import { getFixChannelLayoutFilter, hasCustomChannelLayout, truncateFileName } from './util.js';
 
 describe('hasCustomChannelLayout', () => {
   test('detects layouts that ffmpeg could not express natively', () => {
@@ -42,5 +42,27 @@ describe('getFixChannelLayoutFilter', () => {
   test('needs a channel count to build the map', () => {
     expect(getFixChannelLayoutFilter({ channels: undefined, channelLayout: '4 channels (UNSD+UNSD+UNSD+UNSD)' })).toBeUndefined();
     expect(getFixChannelLayoutFilter({ channels: 0, channelLayout: '4 channels (UNSD+UNSD+UNSD+UNSD)' })).toBeUndefined();
+  });
+});
+
+describe('truncateFileName', () => {
+  test('keeps short names as is', () => {
+    expect(truncateFileName('video.mp4', 10)).toBe('video.mp4');
+  });
+  test('cuts out the middle and keeps the extension', () => {
+    expect(truncateFileName('abcdefghij-seg1.mp4', 14)).toBe('abc…seg1.mp4'); // 3 + 3 (…) + 4 + 4
+    expect(truncateFileName('a.b.c.d.e.mkv', 12)).toBe('a.…d.e.mkv');
+  });
+  test('truncates names without extension', () => {
+    expect(truncateFileName('abcdefghij', 7)).toBe('ab…ij');
+  });
+  test('ignores a dot too early in the name to be an extension', () => {
+    expect(truncateFileName(`Dr. ${'a'.repeat(20)}`, 13)).toBe('Dr. a…aaaaa');
+  });
+  test('counts UTF-8 bytes, or UTF-16 code units, and never splits characters', () => {
+    expect(truncateFileName('日本語の動画です.mp4', 16)).toBe('日…です.mp4'); // 3 bytes per character
+    expect(truncateFileName('日本語の動画です.mp4', 8, true)).toBe('日…です.mp4');
+    expect(truncateFileName('😀😀😀😀.mkv', 16)).toBe('😀…😀.mkv'); // 4 bytes, or 2 code units, per emoji
+    expect(truncateFileName('😀😀😀😀.mkv', 10, true)).toBe('😀…😀.mkv');
   });
 });

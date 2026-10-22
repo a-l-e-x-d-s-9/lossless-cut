@@ -6,8 +6,8 @@ import i18n from 'i18next';
 
 import { getSuffixedOutPath, transferTimestamps, getOutFileExtension, getOutDir, getHtml5ifiedPath, unlinkWithRetry, getFrameDuration, isMac, html5ifiedPrefix, html5dummySuffix, assertFileExists } from '../util';
 import { isCuttingStart, isCuttingEnd, runFfmpegWithProgress, getFfCommandLine, getDuration, createChaptersFromSegments, readFileFfprobeMeta, getExperimentalArgs, getVideoTimescaleArgs, logStdoutStderr, runFfmpegConcat, RefuseOverwriteError, runFfmpeg, readFramesAroundTime } from '../ffmpeg';
-import { getEffectiveAvoidNegativeTs, getMapStreamsArgs, getStreamIdsToCopy, isCopyingOnlyAudioStreams, getRealVideoStreams } from '../util/streams';
-import getAlignedKeyframeCut from '../keyframeCut';
+import { getEffectiveAvoidNegativeTs, getKeyframeCutSeekCompensation, getMapStreamsArgs, getStreamIdsToCopy, isCopyingOnlyAudioStreams, isCropActive, isAspectRatioActive, getRealVideoStreams } from '../util/streams';
+import getAlignedKeyframeCut, { getKeyframeCutTiming } from '../keyframeCut';
 import { needsSmartCut, getCodecParams } from '../smartcut';
 import { getGuaranteedSegments, isDurationValid } from '../segments';
 import type { FFprobeStream } from '../../../common/ffprobe';
@@ -17,8 +17,8 @@ import type { LossyMode } from '../../../main';
 import { UserFacingError } from '../../errors';
 import mainApi from '../mainApi';
 import { formatFfmpegNumber, getFixChannelLayoutFilter, getHwaccelArgs, hasCustomChannelLayout } from '../../../common/util';
+import { join, resolve, dirname } from '../util/path';
 
-const { join, resolve, dirname } = window.require('node:path');
 const { writeFile, mkdir, access, constants: { W_OK } } = window.require('node:fs/promises');
 
 
@@ -288,11 +288,6 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
     const areWeCutting = cuttingStart || cuttingEnd;
     if (areWeCutting) console.log('Cutting from', cuttingStart ? `${cutFrom} (${cutFromWithAdjustment} adjusted ${cutFromAdjustmentFrames} frames)` : 'start', 'to', cuttingEnd ? `${cutTo} (adjusted ${cutToAdjustmentFrames} frames)` : 'end');
 
-    let cutDuration = cutToWithAdjustment - cutFromWithAdjustment;
-    if (detectedFps != null) cutDuration = Math.max(cutDuration, frameDuration); // ensure at least one frame duration
-
-    // Don't cut if not needed: https://github.com/mifi/lossless-cut/issues/50
-    const cutFromArgs = cuttingStart ? ['-ss', formatFfmpegNumber(cutFromWithAdjustment)] : [];
     const copyFileStreamsFiltered = copyFileStreams.filter(({ streamIds }) => streamIds.length > 0);
 
     let alignedCut: ReturnType<typeof getAlignedKeyframeCut>;
@@ -309,13 +304,30 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
         const frameGroups = await Promise.all(times.map((aroundTime) => readFramesAroundTime({ filePath: singleInput.path, streamIndex: video.index, aroundTime, window: 10 })));
         alignedCut = getAlignedKeyframeCut({ frames: frameGroups.flat(), cutFrom: cutFromWithAdjustment, cutTo: cutToWithAdjustment });
         if (alignedCut != null) {
-          cutDuration = alignedCut.duration;
           console.log('Trimming keyframe-aligned Matroska cut at decode timestamps', alignedCut);
         }
       }
     }
+
+    // Use DTS output trimming for our aligned cuts, or upstream's input-seek
+    // compensation for other cuts. Applying both would shift the cut twice.
+    const singleInputMeta = singleInput != null ? allFilesMeta[singleInput.path] : undefined;
+    const proposedCompensation = ssBeforeInput && cuttingStart && singleInputMeta != null
+      ? getKeyframeCutSeekCompensation({ formatName: singleInputMeta.format.format_name, streams: singleInputMeta.streams, cutFrom: cutFromWithAdjustment })
+      : 0;
+    const { duration: cutDuration, inputSeek, seekCompensation, outputSeek } = getKeyframeCutTiming({
+      cutFrom: cutFromWithAdjustment,
+      cutTo: cutToWithAdjustment,
+      frameDuration,
+      alignedCut,
+      seekCompensation: proposedCompensation,
+    });
+
+    // Don't cut if not needed: https://github.com/mifi/lossless-cut/issues/50
+    const cutFromArgs = cuttingStart ? ['-ss', formatFfmpegNumber(inputSeek)] : [];
+    const seekCompensationArgs = seekCompensation > 0 ? ['-itsoffset', formatFfmpegNumber(seekCompensation)] : [];
     const cutToArgs = cuttingEnd ? ['-t', formatFfmpegNumber(cutDuration)] : [];
-    const outputSeekArgs = alignedCut?.outputSeek != null ? ['-ss', formatFfmpegNumber(alignedCut.outputSeek)] : [];
+    const outputSeekArgs = outputSeek != null ? ['-ss', formatFfmpegNumber(outputSeek)] : [];
 
     // remove -avoid_negative_ts make_zero when not cutting start (no -ss), or else some videos get blank first frame in QuickLook
     // note: `make_zero`/`make_non_negative` get downgraded to `auto` when copying a cover art stream, or else the
@@ -348,7 +360,7 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
         ];
       })
       : [
-        ...(ssBeforeInput ? cutFromArgs : []),
+        ...(ssBeforeInput ? [...cutFromArgs, ...seekCompensationArgs] : []),
         '-i', copyFileStreamsFiltered[0]!.path,
         ...(!ssBeforeInput ? cutFromArgs : outputSeekArgs),
         ...cutToArgs,
@@ -407,37 +419,33 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
             const getStream = () => getFileStreams()?.find((s) => s.index === streamId);
 
             // Lossless crop via codec bitstream metadata (#643)
-            if (streamParams.crop) {
+            if (isCropActive(streamParams.crop)) {
               const { left, right, top, bottom } = streamParams.crop;
-              if (left > 0 || right > 0 || top > 0 || bottom > 0) {
-                // Look up codec_name from allFilesMeta to determine the correct bitstream filter
-                const streamInfo = getStream();
-                const codecName = streamInfo?.codec_name;
+              // Look up codec_name from allFilesMeta to determine the correct bitstream filter
+              const streamInfo = getStream();
+              const codecName = streamInfo?.codec_name;
 
-                const cropParams = `crop_left=${left}:crop_right=${right}:crop_top=${top}:crop_bottom=${bottom}`;
-                if (codecName === 'h264') {
-                  bitstreamFilters.push(`h264_metadata=${cropParams}`);
-                } else if (codecName === 'hevc') {
-                  bitstreamFilters.push(`hevc_metadata=${cropParams}`);
-                }
+              const cropParams = `crop_left=${left}:crop_right=${right}:crop_top=${top}:crop_bottom=${bottom}`;
+              if (codecName === 'h264') {
+                bitstreamFilters.push(`h264_metadata=${cropParams}`);
+              } else if (codecName === 'hevc') {
+                bitstreamFilters.push(`hevc_metadata=${cropParams}`);
               }
             }
 
             // Lossless aspect ratio (SAR) via codec bitstream metadata (#643)
-            if (streamParams.aspectRatio) {
+            if (isAspectRatioActive(streamParams.aspectRatio)) {
               const { num, den } = streamParams.aspectRatio;
-              if (num > 0 && den > 0) {
-                const streamInfo = getStream();
-                const codecName = streamInfo?.codec_name;
+              const streamInfo = getStream();
+              const codecName = streamInfo?.codec_name;
 
-                if (codecName === 'h264') {
-                  bitstreamFilters.push(`h264_metadata=sample_aspect_ratio=${num}/${den}`);
-                } else if (codecName === 'hevc') {
-                  bitstreamFilters.push(`hevc_metadata=sample_aspect_ratio=${num}/${den}`);
-                } else {
-                  // For non-H264/HEVC codecs, use container-level -aspect flag
-                  ret.push('-aspect', `${num}:${den}`);
-                }
+              if (codecName === 'h264') {
+                bitstreamFilters.push(`h264_metadata=sample_aspect_ratio=${num}/${den}`);
+              } else if (codecName === 'hevc') {
+                bitstreamFilters.push(`hevc_metadata=sample_aspect_ratio=${num}/${den}`);
+              } else {
+                // For non-H264/HEVC codecs, use container-level -aspect flag
+                ret.push('-aspect', `${num}:${den}`);
               }
             }
 
@@ -687,8 +695,12 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
         await cutEncodeSmartPart({ cutFrom, cutTo, outPath, outFormat, videoCodec, videoBitrate: encCustomBitrate != null ? encCustomBitrate * 1000 : sourceCodecParams.videoBitrate, videoStreamIndex: videoStream.index, videoTimebase: sourceCodecParams.videoTimebase, allFilesMeta, copyFileStreams: copyFileStreamsFiltered, ffmpegExperimental, hasBFrames: sourceCodecParams.videoStream.has_b_frames });
       }
 
+      // used when the final output file was produced by encoding or concat, because they don't transfer the timestamps of the segment
+      const transferSegmentTimestamps = async () => transferTimestamps({ inPath: filePath, outPath: finalOutPath, cutFrom: desiredCutFrom, cutTo, duration: isDurationValid(fileDuration) ? fileDuration : undefined, treatInputFileModifiedTimeAsStart, treatOutputFileModifiedTimeAsStart });
+
       const cutEncodeWholePart = async () => {
         await cutEncodeSmartPartWrapper({ cutFrom: desiredCutFrom, cutTo, outPath: finalOutPath });
+        await transferSegmentTimestamps();
         return { path: finalOutPath, created: true };
       };
 
@@ -745,6 +757,8 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
         const { streams: streamsAfterCut } = await readFileFfprobeMeta(losslessPartOutPath);
 
         await concatFiles({ paths: smartCutSegmentsToConcat, outDir: outputDir, outPath: finalOutPath, metadataFromPath: losslessPartOutPath, outFormat, includeAllStreams: true, streams: streamsAfterCut, ffmpegExperimental, preserveMovData, movFastStart, chapters, preserveMetadataOnMerge, videoTimebase, onProgress: onConcatProgress });
+        // concatFiles copied the timestamps of the lossless part (which starts at the next keyframe, not at the segment start)
+        await transferSegmentTimestamps();
         return { path: finalOutPath, created: true };
       } finally {
         await tryDeleteFiles(smartCutSegmentsToConcat);
@@ -756,7 +770,7 @@ function useFfmpegOperations({ filePath, treatInputFileModifiedTimeAsStart, trea
     } finally {
       if (chaptersPath) await tryDeleteFiles([chaptersPath]);
     }
-  }, [shouldSkipExistingFile, isEncoding, filePath, lossyMode, losslessCutSingle, cutEncodeSmartPart, encCustomBitrate, concatFiles]);
+  }, [shouldSkipExistingFile, isEncoding, filePath, lossyMode, losslessCutSingle, cutEncodeSmartPart, encCustomBitrate, concatFiles, treatInputFileModifiedTimeAsStart, treatOutputFileModifiedTimeAsStart]);
 
   const concatCutSegments = useCallback(async ({ customOutDir, outFormat, segmentPaths, ffmpegExperimental, onProgress, preserveMovData, movFastStart, chapterNames, preserveMetadataOnMerge, mergedOutFilePath }: {
     customOutDir: string | undefined,
